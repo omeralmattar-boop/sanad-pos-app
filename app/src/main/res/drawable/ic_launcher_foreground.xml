@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Emerald Ledger Card Base -->
+    <path
+        android:fillColor="#10B981"
+        android:pathData="M32,28h36c3.3,0 6,2.7 6,6v40c0,3.3 -2.7,6 -6,6H32c-3.3,0 -6,-2.7 -6,-6V34C26,30.7 28.7,28 32,28z" />
+    <!-- Electric Blue Invoice Overlay -->
+    <path
+        android:fillColor="#3B82F6"
+        android:pathData="M40,36h36c3.3,0 6,2.7 6,6v34c0,3.3 -2.7,6 -6,6H40c-3.3,0 -6,-2.7 -6,-6V42C34,38.7 36.7,36 40,36z" />
+    <!-- Crisp White Financial Bars -->
+    <path
+        android:fillColor="#F8FAFC"
+        android:pathData="M42,46h20v4H42zM42,54h28v4H42zM42,62h16v4H42z" />
+    <!-- Gold Currency Accent Dot -->
+    <path
+        android:fillColor="#F59E0B"
+        android:pathData="M66,64m-5,0a5,5 0,1 1,10 0a5,5 0,1 1,-10 0" />
+</vector>

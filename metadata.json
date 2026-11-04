@@ -1,0 +1,6 @@
+{
+  "name": "سند للمحاسبة",
+  "description": "نظام سند الشامل للمحاسبة ونقاط البيع وإدارة المخزون متعدد العملات مع الذكاء الاصطناعي",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
