@@ -31,7 +31,7 @@ import kotlinx.coroutines.launch
         ShiftEntity::class,
         JournalEntryEntity::class
     ],
-    version = 2,
+    version = 3,
     exportSchema = false
 )
 @TypeConverters(SanadTypeConverters::class)

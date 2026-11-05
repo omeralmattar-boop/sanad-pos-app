@@ -1,0 +1,134 @@
+package com.example.ui.viewmodel
+
+import android.graphics.Bitmap
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.viewModelScope
+import com.example.data.remote.GeminiSupplierOcrService
+import com.example.data.remote.ImportedSupplierItem
+import com.example.data.remote.SupplierInvoiceOcrWorkflow
+import com.example.data.remote.SupplierInvoiceDraft
+import com.example.data.remote.ai.GeminiAssistantService
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+
+data class OcrUiState(
+    val isLoading: Boolean = false,
+    val stageName: String = "الالتقاط",
+    val errorMessage: String? = null,
+    val draft: SupplierInvoiceDraft? = null,
+    val items: List<ImportedSupplierItem> = emptyList(),
+    val vatLandedCost: Double = 0.0
+)
+
+class SanadViewModel : ViewModel() {
+
+    private val _uiState = MutableStateFlow(OcrUiState())
+    val uiState: StateFlow<OcrUiState> = _uiState.asStateFlow()
+
+    private val geminiAssistant = GeminiAssistantService
+    private val supplierOcr = GeminiSupplierOcrService
+
+    fun processSupplierInvoiceImage(
+        bitmap: Bitmap,
+        apiKey: String,
+        supplierName: String,
+        paymentSource: String = "bank",
+        currency: String = "SAR"
+    ) {
+        viewModelScope.launch {
+            _uiState.value = _uiState.value.copy(
+                isLoading = true,
+                stageName = "الالتقاط",
+                errorMessage = null
+            )
+
+            try {
+                val optimized = withContext(Dispatchers.Default) {
+                    geminiAssistant.optimizeBitmapForAi(bitmap, 1024)
+                }
+                val imageBase64 = withContext(Dispatchers.Default) {
+                    geminiAssistant.bitmapToBase64Jpeg(optimized)
+                }
+
+                val extractedItemsResult = supplierOcr.analyzeSupplierInvoiceWithGemini(
+                    base64Jpeg = imageBase64,
+                    userApiKey = apiKey,
+                    modelName = "gemini-1.5-flash"
+                )
+
+                val extractedItems = extractedItemsResult.getOrElse { emptyList() }
+                if (extractedItems.isEmpty()) {
+                    _uiState.value = _uiState.value.copy(
+                        isLoading = false,
+                        errorMessage = "تعذر استخراج بيانات الفاتورة من الصورة."
+                    )
+                    return@launch
+                }
+
+                _uiState.value = _uiState.value.copy(
+                    stageName = "مسودة 24 ساعة",
+                    items = extractedItems
+                )
+
+                val rawText = """
+                    supplier=$supplierName
+                    items=${extractedItems.size}
+                    total=${extractedItems.sumOf { it.extractedLineTotal }}
+                    currency=$currency
+                """.trimIndent()
+
+                val draft = SupplierInvoiceOcrWorkflow.ocrPurchaseDraft(rawText, supplierName)
+                _uiState.value = _uiState.value.copy(
+                    stageName = "المراجعة والأسعار",
+                    draft = draft.copy(items = extractedItems)
+                )
+
+                val reviewed = SupplierInvoiceOcrWorkflow.reviewInvoiceAndPrices(
+                    draft.copy(items = extractedItems, total = extractedItems.sumOf { it.extractedLineTotal })
+                )
+
+                val radarUpdated = SupplierInvoiceOcrWorkflow.priceRadar(reviewed)
+                _uiState.value = _uiState.value.copy(
+                    stageName = "رادار الأسعار",
+                    draft = radarUpdated
+                )
+
+                val payReady = SupplierInvoiceOcrWorkflow.ocrPurchasePayPlatform(
+                    draft = radarUpdated,
+                    paymentSource = paymentSource
+                )
+
+                val totalCost = payReady.items.sumOf { it.extractedLineTotal }
+                val vatRate = 0.15
+                val vatLandedCost = totalCost * vatRate
+
+                val finalDraft = SupplierInvoiceOcrWorkflow.saveInvoiceWithVatLandedCost(
+                    draft = payReady,
+                    vatLandedCost = vatLandedCost
+                )
+
+                _uiState.value = _uiState.value.copy(
+                    isLoading = false,
+                    stageName = "تم الحفظ",
+                    draft = finalDraft,
+                    items = finalDraft.items,
+                    vatLandedCost = finalDraft.vatLandedCost
+                )
+            } catch (e: Exception) {
+                _uiState.value = _uiState.value.copy(
+                    isLoading = false,
+                    stageName = "خطأ",
+                    errorMessage = e.localizedMessage ?: "حدث خطأ أثناء معالجة الفاتورة"
+                )
+            }
+        }
+    }
+
+    fun resetState() {
+        _uiState.value = OcrUiState()
+    }
+}

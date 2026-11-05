@@ -111,7 +111,9 @@ import com.example.ui.theme.SanadSurfaceElevated
 import com.example.ui.theme.SanadTextPrimary
 import com.example.ui.theme.SanadTextSecondary
 import com.example.ui.viewmodel.SanadViewModel
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -861,6 +863,7 @@ data class OcrPurchaseLocalDraft(
     val exchangeRate: Double,
     val includeTaxInLandedCost: Boolean,
     val taxAmount: Double,
+    val vatLandedCost: Double = if (includeTaxInLandedCost) taxAmount else 0.0,
     val shippingAdditions: Double,
     val supplierDiscount: Double,
     val keepDocumentCurrency: Boolean,
@@ -1133,7 +1136,10 @@ fun AiSupplierInvoiceScannerScreen(
         }
         if (initialSharedFileLabel != null && existingDraft == null) {
             val bmp = createSampleInvoiceBitmap()
-            val base64Jpeg = GeminiSupplierOcrService.compressBitmapToBase64(bmp, maxDimension = 1024)
+            val base64Jpeg = withContext(Dispatchers.Default) {
+                val optimized = com.example.data.remote.ai.GeminiAssistantService.optimizeBitmapForAi(bmp, maxDimension = 1024)
+                com.example.data.remote.ai.GeminiAssistantService.bitmapToBase64Jpeg(optimized)
+            }
             compressedSizeInfo = "تم استقبال ملف خارجي مشترك ($initialSharedFileLabel) وضغطه بنجاح"
             val result = GeminiSupplierOcrService.analyzeSupplierInvoiceWithGemini(
                 base64Jpeg = base64Jpeg,
@@ -1146,12 +1152,27 @@ fun AiSupplierInvoiceScannerScreen(
         }
     }
 
+    fun onInvoiceBitmapCaptured(bitmap: Bitmap) {
+        val apiKey = geminiApiKey.ifBlank { "YOUR_GEMINI_API_KEY" }
+        viewModel.processSupplierInvoiceImage(
+            bitmap = bitmap,
+            apiKey = apiKey,
+            supplierName = supplierName.ifBlank { "معصرة الجنوب" },
+            paymentSource = singlePaymentSourceType.lowercase().ifBlank { "bank" },
+            currency = documentCurrency.ifBlank { "SAR" }
+        )
+    }
+
     fun runAiAnalysisWithBitmap(bitmap: Bitmap, sourceLabel: String) {
         fileValidationError = null
         selectedSourceLabel = sourceLabel
         isAnalyzing = true
+        onInvoiceBitmapCaptured(bitmap)
         scope.launch {
-            val base64Jpeg = GeminiSupplierOcrService.compressBitmapToBase64(bitmap, maxDimension = 1024)
+            val base64Jpeg = withContext(Dispatchers.Default) {
+                val optimized = com.example.data.remote.ai.GeminiAssistantService.optimizeBitmapForAi(bitmap, maxDimension = 1024)
+                com.example.data.remote.ai.GeminiAssistantService.bitmapToBase64Jpeg(optimized)
+            }
             compressedSizeInfo = "تم ضغط الصورة بنجاح (maxDimension = 1024px • الحجم: ${base64Jpeg.length / 1024} KB)"
             val result = GeminiSupplierOcrService.analyzeSupplierInvoiceWithGemini(
                 base64Jpeg = base64Jpeg,
@@ -2937,6 +2958,7 @@ fun AiSupplierInvoiceScannerScreen(
                                                     fileValidationError = "رصيد الخزينة / الحساب البنكي غير كافٍ للدفع الفوري!"
                                                     return@launch
                                                 }
+                                                val explicitVatLandedCost = if (includeTaxInLandedCost) taxVal else 0.0
                                                 viewModel.commitSixStageOcrPurchase(
                                                     supplierId = supplierId,
                                                     supplierName = supplierName,
@@ -2946,6 +2968,7 @@ fun AiSupplierInvoiceScannerScreen(
                                                     exchangeRateLocked = exchangeRate,
                                                     includeTaxInCost = includeTaxInLandedCost,
                                                     taxAmount = taxVal,
+                                                    vatLandedCost = explicitVatLandedCost,
                                                     shippingAdditionAmount = shippingVal,
                                                     supplierDiscountAmount = discountVal,
                                                     paymentMethod = effectivePaymentMethod,
@@ -3194,3 +3217,61 @@ private fun createSampleInvoiceBitmap(): Bitmap {
     canvas.drawText("2. أرز بسمتي 5 كغ - 20 كيس × 8900 ر.ي", 100f, 340f, paint)
     return bmp
 }
+
+@Composable
+fun B2BAndAiInvoiceImportScreen(
+    viewModel: SanadViewModel
+) {
+    val uiState by viewModel.uiState.collectAsState()
+
+    fun onInvoiceBitmapCaptured(bitmap: Bitmap) {
+        val apiKey = "YOUR_GEMINI_API_KEY"
+        viewModel.processSupplierInvoiceImage(
+            bitmap = bitmap,
+            apiKey = apiKey,
+            supplierName = "معصرة الجنوب",
+            paymentSource = "bank",
+            currency = "SAR"
+        )
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(16.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp)
+    ) {
+        Text("معالج تصوير فاتورة المورد")
+        Text("المرحلة الحالية: ${uiState.stageName}")
+
+        if (uiState.isLoading) {
+            CircularProgressIndicator()
+        }
+
+        Button(
+            onClick = {
+                val bitmap: Bitmap = createSampleInvoiceBitmap()
+                onInvoiceBitmapCaptured(bitmap)
+            }
+        ) {
+            Text("بدء المعالجة")
+        }
+
+        val currentErrorMessage = uiState.errorMessage
+        if (currentErrorMessage != null) {
+            Text(
+                text = currentErrorMessage,
+                color = MaterialTheme.colorScheme.error
+            )
+        }
+
+        val currentDraft = uiState.draft
+        if (currentDraft != null) {
+            Text("رقم الفاتورة: ${currentDraft.invoiceNumber}")
+            Text("المصدر: ${currentDraft.supplierName}")
+            Text("المجموع: ${currentDraft.total}")
+            Text("ضريبة التكلفة: ${uiState.vatLandedCost}")
+        }
+    }
+}
+

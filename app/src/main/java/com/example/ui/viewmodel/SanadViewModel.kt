@@ -1,6 +1,7 @@
 package com.example.ui.viewmodel
 
 import android.app.Application
+import android.graphics.Bitmap
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.data.local.AccountType
@@ -34,6 +35,12 @@ import com.example.data.local.StockMovementType
 import com.example.data.local.SupplierEntity
 import com.example.data.local.TaxType
 import com.example.data.local.VoucherDirection
+import com.example.data.remote.GeminiSupplierOcrService
+import com.example.data.remote.ImportedSupplierItem
+import com.example.data.remote.SupplierInvoiceDraft
+import com.example.data.remote.SupplierInvoiceOcrWorkflow
+import com.example.data.remote.ai.GeminiAssistantService
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -41,7 +48,17 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlin.math.roundToLong
+
+data class OcrUiState(
+    val isLoading: Boolean = false,
+    val stageName: String = "الالتقاط",
+    val errorMessage: String? = null,
+    val draft: SupplierInvoiceDraft? = null,
+    val items: List<ImportedSupplierItem> = emptyList(),
+    val vatLandedCost: Double = 0.0
+)
 
 // ============================================================================
 // INTERACTIVE INVOICE CART LINE DRAFT
@@ -89,6 +106,7 @@ data class InvoiceEditorState(
     val isRateLocked: Boolean = true,
     val includeVat: Boolean = false,
     val vatPercent: Double = 0.0,
+    val vatLandedCost: Double = 0.0,
     val discountAmount: Double = 0.0,
     val additionAmount: Double = 0.0,
     val paymentMethod: PaymentMethod = PaymentMethod.CASH,
@@ -956,6 +974,7 @@ class SanadViewModel(application: Application) : AndroidViewModel(application) {
                 additionAmount = state.additionAmount,
                 vatPercent = if (state.includeVat) state.vatPercent else 0.0,
                 vatAmount = state.calculatedVatAmount,
+                vatLandedCost = if (state.mode == InvoiceMode.PURCHASE && state.includeVat) state.calculatedVatAmount else state.vatLandedCost,
                 netTotalAmount = state.netTotalAmount,
                 netTotalBaseEquivalent = state.netTotalUsdEquivalent,
                 totalCostAmount = state.totalCostAmount,
@@ -1138,29 +1157,11 @@ class SanadViewModel(application: Application) : AndroidViewModel(application) {
             val savedId = dao.saveProductWithUnitsAndComponents(
                 product = product,
                 units = relationalUnits,
-                components = relationalComponents
+                components = relationalComponents,
+                insertOpeningStockMovement = editingProductId == null && availableQuantity > 0
             )
 
-            if (editingProductId == null && availableQuantity > 0) {
-                val rate = currencies.value.find { it.code == transactionCurrency }?.exchangeRateToBase ?: 1550.0
-                dao.insertStockMovement(
-                    StockMovementEntity(
-                        productId = savedId,
-                        productName = product.name,
-                        movementType = StockMovementType.OPENING_STOCK,
-                        quantityDelta = availableQuantity,
-                        balanceAfter = availableQuantity,
-                        unitName = product.baseUnitName,
-                        unitCostAtMovement = costPrice,
-                        unitPriceAtMovement = retailPrice,
-                        currencyCode = transactionCurrency,
-                        exchangeRateLocked = rate,
-                        reasonOrNotes = "رصيد افتتاحي عند تعريف الصنف"
-                    )
-                )
-            }
-
-            showMessage("تم حفظ الصنف (${product.name}) في المستودع بنجاح")
+            showMessage("تم حفظ الصنف (${product.name} #$savedId) في المستودع بنجاح")
         }
     }
 
@@ -1456,6 +1457,7 @@ class SanadViewModel(application: Application) : AndroidViewModel(application) {
         exchangeRateLocked: Double,
         includeTaxInCost: Boolean,
         taxAmount: Double,
+        vatLandedCost: Double = if (includeTaxInCost) taxAmount else 0.0,
         shippingAdditionAmount: Double,
         supplierDiscountAmount: Double,
         paymentMethod: PaymentMethod,
@@ -1546,26 +1548,40 @@ class SanadViewModel(application: Application) : AndroidViewModel(application) {
             }
 
             val subtotal = purchaseLines.sumOf { it.lineTotal }
-            val effectiveVat = if (includeTaxInCost) taxAmount else 0.0
-            val netTotal = (subtotal + shippingAdditionAmount + effectiveVat - supplierDiscountAmount).coerceAtLeast(0.0)
+            val explicitVatLandedCost = if (includeTaxInCost) vatLandedCost else 0.0
+            val netTotal = (subtotal + shippingAdditionAmount + explicitVatLandedCost - supplierDiscountAmount).coerceAtLeast(0.0)
             val paid = if (paymentMethod == PaymentMethod.CASH) netTotal else 0.0
             val remaining = (netTotal - paid).coerceAtLeast(0.0)
 
+            val workflowDraft = com.example.data.remote.SupplierInvoiceOcrWorkflow.saveInvoiceWithVatLandedCost(
+                draft = com.example.data.remote.SupplierInvoiceDraft(
+                    invoiceId = "PUR-$finalInvNum",
+                    supplierName = supplierName.ifBlank { "مورد عام" },
+                    invoiceNumber = finalInvNum,
+                    total = netTotal,
+                    currency = currencyCode,
+                    items = activeItems,
+                    vatLandedCost = 0.0
+                ),
+                vatLandedCost = explicitVatLandedCost
+            )
+
             val purchaseInvoice = SaleInvoiceEntity(
-                invoiceNumber = "PUR-$finalInvNum",
-                paperBookNumber = finalInvNum,
+                invoiceNumber = workflowDraft.invoiceId,
+                paperBookNumber = workflowDraft.invoiceNumber,
                 mode = InvoiceMode.PURCHASE,
                 status = InvoiceStatus.COMPLETED,
                 pricingTier = PricingTier.WHOLESALE,
                 partyId = supplierId,
-                partyName = supplierName.ifBlank { "مورد عام" },
-                currencyCode = currencyCode,
+                partyName = workflowDraft.supplierName,
+                currencyCode = workflowDraft.currency,
                 lockedExchangeRate = exchangeRateLocked,
                 subtotalAmount = subtotal,
                 discountAmount = supplierDiscountAmount,
                 additionAmount = shippingAdditionAmount,
-                vatPercent = if (subtotal > 0 && effectiveVat > 0) (effectiveVat / subtotal) * 100.0 else 0.0,
-                vatAmount = effectiveVat,
+                vatPercent = if (subtotal > 0 && workflowDraft.vatLandedCost > 0) (workflowDraft.vatLandedCost / subtotal) * 100.0 else 0.0,
+                vatAmount = taxAmount,
+                vatLandedCost = workflowDraft.vatLandedCost,
                 netTotalAmount = netTotal,
                 netTotalBaseEquivalent = if (exchangeRateLocked > 0) netTotal / exchangeRateLocked else netTotal,
                 totalCostAmount = netTotal,
@@ -1574,7 +1590,7 @@ class SanadViewModel(application: Application) : AndroidViewModel(application) {
                 remainingCreditAmount = remaining,
                 financialAccountId = financialAccountId,
                 financialAccountName = financialAccountName,
-                notes = "استيراد فاتورة مورد بالذكاء الاصطناعي (رقم ضريبي: ${supplierTaxNumber.ifBlank { "غير محدد" }})",
+                notes = "استيراد فاتورة مورد بالذكاء الاصطناعي (رقم ضريبي: ${supplierTaxNumber.ifBlank { "غير محدد" }} • vatLandedCost=${workflowDraft.vatLandedCost})",
                 timestamp = now
             )
 
@@ -1582,6 +1598,126 @@ class SanadViewModel(application: Application) : AndroidViewModel(application) {
             showMessage("تم اعتماد فاتورة الشراء (${purchaseInvoice.invoiceNumber}) وتحديث المخزون ومتوسط التكلفة المرجح بنجاح")
             onCommitted(purchaseInvoice.invoiceNumber)
         }
+    }
+
+    // ========================================================================
+    // 6-STAGE SUPPLIER INVOICE OCR WORKFLOW STATE & PROCESSOR
+    // ========================================================================
+    private val _uiState = MutableStateFlow(OcrUiState())
+    val uiState: StateFlow<OcrUiState> = _uiState.asStateFlow()
+
+    private val geminiAssistant = GeminiAssistantService
+    private val supplierOcr = GeminiSupplierOcrService
+
+    fun onInvoiceBitmapCaptured(bitmap: Bitmap) {
+        val apiKey = "YOUR_GEMINI_API_KEY"
+        processSupplierInvoiceImage(
+            bitmap = bitmap,
+            apiKey = apiKey,
+            supplierName = "معصرة الجنوب",
+            paymentSource = "bank",
+            currency = "SAR"
+        )
+    }
+
+    fun processSupplierInvoiceImage(
+        bitmap: Bitmap,
+        apiKey: String,
+        supplierName: String,
+        paymentSource: String = "bank",
+        currency: String = "SAR"
+    ) {
+        viewModelScope.launch {
+            _uiState.value = _uiState.value.copy(
+                isLoading = true,
+                stageName = "الالتقاط",
+                errorMessage = null
+            )
+
+            try {
+                val optimized = withContext(Dispatchers.Default) {
+                    geminiAssistant.optimizeBitmapForAi(bitmap, 1024)
+                }
+                val imageBase64 = withContext(Dispatchers.Default) {
+                    geminiAssistant.bitmapToBase64Jpeg(optimized)
+                }
+
+                val extractedItemsResult = supplierOcr.analyzeSupplierInvoiceWithGemini(
+                    base64Jpeg = imageBase64,
+                    userApiKey = apiKey,
+                    modelName = "gemini-1.5-flash"
+                )
+
+                val extractedItems = extractedItemsResult.getOrElse { emptyList() }
+                if (extractedItems.isEmpty()) {
+                    _uiState.value = _uiState.value.copy(
+                        isLoading = false,
+                        errorMessage = "تعذر استخراج بيانات الفاتورة من الصورة."
+                    )
+                    return@launch
+                }
+
+                _uiState.value = _uiState.value.copy(
+                    stageName = "مسودة 24 ساعة",
+                    items = extractedItems
+                )
+
+                val rawText = """
+                    supplier=$supplierName
+                    items=${extractedItems.size}
+                    total=${extractedItems.sumOf { it.extractedLineTotal }}
+                    currency=$currency
+                """.trimIndent()
+
+                val draft = SupplierInvoiceOcrWorkflow.ocrPurchaseDraft(rawText, supplierName)
+                _uiState.value = _uiState.value.copy(
+                    stageName = "المراجعة والأسعار",
+                    draft = draft.copy(items = extractedItems)
+                )
+
+                val reviewed = SupplierInvoiceOcrWorkflow.reviewInvoiceAndPrices(
+                    draft.copy(items = extractedItems, total = extractedItems.sumOf { it.extractedLineTotal })
+                )
+
+                val radarUpdated = SupplierInvoiceOcrWorkflow.priceRadar(reviewed)
+                _uiState.value = _uiState.value.copy(
+                    stageName = "رادار الأسعار",
+                    draft = radarUpdated
+                )
+
+                val payReady = SupplierInvoiceOcrWorkflow.ocrPurchasePayPlatform(
+                    draft = radarUpdated,
+                    paymentSource = paymentSource
+                )
+
+                val totalCost = payReady.items.sumOf { it.extractedLineTotal }
+                val vatRate = 0.15
+                val vatLandedCost = totalCost * vatRate
+
+                val finalDraft = SupplierInvoiceOcrWorkflow.saveInvoiceWithVatLandedCost(
+                    draft = payReady,
+                    vatLandedCost = vatLandedCost
+                )
+
+                _uiState.value = _uiState.value.copy(
+                    isLoading = false,
+                    stageName = "تم الحفظ",
+                    draft = finalDraft,
+                    items = finalDraft.items,
+                    vatLandedCost = finalDraft.vatLandedCost
+                )
+            } catch (e: Exception) {
+                _uiState.value = _uiState.value.copy(
+                    isLoading = false,
+                    stageName = "خطأ",
+                    errorMessage = e.localizedMessage ?: "حدث خطأ أثناء معالجة الفاتورة"
+                )
+            }
+        }
+    }
+
+    fun resetState() {
+        _uiState.value = OcrUiState()
     }
 }
 

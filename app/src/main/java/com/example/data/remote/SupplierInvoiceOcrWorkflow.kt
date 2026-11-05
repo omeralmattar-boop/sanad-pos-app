@@ -1,0 +1,48 @@
+package com.example.data.remote
+
+data class SupplierInvoiceDraft(
+    val invoiceId: String,
+    val supplierName: String,
+    val invoiceNumber: String,
+    val total: Double,
+    val currency: String,
+    val items: List<ImportedSupplierItem>,
+    val vatLandedCost: Double = 0.0
+)
+
+object SupplierInvoiceOcrWorkflow {
+
+    fun ocrPurchaseDraft(rawText: String, supplierName: String): SupplierInvoiceDraft {
+        // 1) الالتقاط -> 2) المسودة لمدة 24 ساعة
+        return SupplierInvoiceDraft(
+            invoiceId = "PUR-${System.currentTimeMillis()}",
+            supplierName = supplierName,
+            invoiceNumber = "OCR-${System.currentTimeMillis()}",
+            total = 0.0,
+            currency = "SAR",
+            items = emptyList(),
+            vatLandedCost = 0.0
+        )
+    }
+
+    fun reviewInvoiceAndPrices(draft: SupplierInvoiceDraft): SupplierInvoiceDraft {
+        // 3) المراجعة والأسعار
+        return draft
+    }
+
+    fun priceRadar(draft: SupplierInvoiceDraft): SupplierInvoiceDraft {
+        // 4) رادار الأسعار
+        return draft
+    }
+
+    fun ocrPurchasePayPlatform(draft: SupplierInvoiceDraft, paymentSource: String): SupplierInvoiceDraft {
+        // 5) الدفع من مصدر واحد
+        require(paymentSource.isNotBlank()) { "Payment source is required" }
+        return draft
+    }
+
+    fun saveInvoiceWithVatLandedCost(draft: SupplierInvoiceDraft, vatLandedCost: Double): SupplierInvoiceDraft {
+        // 6) حفظ الفاتورة + تثبيت ضريبة التكلفة
+        return draft.copy(vatLandedCost = vatLandedCost)
+    }
+}

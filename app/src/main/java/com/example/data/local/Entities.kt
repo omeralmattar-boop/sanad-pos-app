@@ -375,6 +375,7 @@ data class SaleInvoiceEntity(
     val additionAmount: Double = 0.0,   // إضافات (التعديلات المالية)
     val vatPercent: Double = 0.0,       // ضريبة القيمة المضافة
     val vatAmount: Double = 0.0,
+    val vatLandedCost: Double = 0.0,    // ضريبة القيمة المضافة المضمنة في تكلفة الشراء (Landed Cost VAT)
     val netTotalAmount: Double,         // الإجمالي بعملة المعاملة
     val netTotalBaseEquivalent: Double, // الإجمالي بالعملة المقابلة (العملتين)
     val totalCostAmount: Double = 0.0,

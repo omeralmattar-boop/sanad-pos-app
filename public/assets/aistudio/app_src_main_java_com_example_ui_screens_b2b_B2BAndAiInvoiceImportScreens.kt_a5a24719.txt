@@ -1,0 +1,54 @@
+package com.example.ui.screens.b2b
+
+import android.graphics.Bitmap
+import androidx.compose.foundation.layout.*
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.unit.dp
+import com.example.ui.viewmodel.SanadViewModel
+
+@Composable
+fun B2BAndAiInvoiceImportScreen(
+    viewModel: SanadViewModel
+) {
+    val uiState by viewModel.uiState.collectAsState()
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(16.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp)
+    ) {
+        Text("معالج تصوير فاتورة المورد")
+        Text("المرحلة الحالية: ${uiState.stageName}")
+
+        if (uiState.isLoading) {
+            CircularProgressIndicator()
+        }
+
+        Button(
+            onClick = {
+                // مثال: عند التقاط صورة من الكاميرا أو اختيار صورة من المعرض
+                // val bitmap: Bitmap = ...
+                // viewModel.processSupplierInvoiceImage(bitmap, apiKey = "...", supplierName = "معصرة الجنوب", paymentSource = "bank")
+            }
+        ) {
+            Text("بدء المعالجة")
+        }
+
+        if (uiState.errorMessage != null) {
+            Text(
+                text = uiState.errorMessage,
+                color = MaterialTheme.colorScheme.error
+            )
+        }
+
+        if (uiState.draft != null) {
+            Text("رقم الفاتورة: ${uiState.draft.invoiceNumber}")
+            Text("المصدر: ${uiState.draft.supplierName}")
+            Text("المجموع: ${uiState.draft.total}")
+            Text("ضريبة التكلفة: ${uiState.vatLandedCost}")
+        }
+    }
+}

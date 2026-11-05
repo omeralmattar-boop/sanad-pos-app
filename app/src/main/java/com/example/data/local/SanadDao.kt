@@ -103,6 +103,9 @@ interface SanadDao {
     @Query("SELECT * FROM products WHERE isActive = 1 ORDER BY id ASC")
     fun observeActiveProducts(): Flow<List<ProductEntity>>
 
+    @Query("SELECT * FROM products WHERE isActive = 1 ORDER BY id ASC")
+    suspend fun getProductsSnapshot(): List<ProductEntity>
+
     @Transaction
     @Query("SELECT * FROM products WHERE isActive = 1 ORDER BY id ASC")
     fun observeProductsWithRelations(): Flow<List<ProductWithRelations>>
@@ -179,23 +182,47 @@ interface SanadDao {
     fun observeInventoryCountSessions(): Flow<List<InventorySessionWithLines>>
 
     /**
-     * Saves a Product along with its relational ProductUnitEntity and CompositeComponentEntity rows
+     * Saves a Product along with its relational ProductUnitEntity, CompositeComponentEntity,
+     * and optional OPENING_STOCK movement atomically inside @Transaction
      */
     @Transaction
     suspend fun saveProductWithUnitsAndComponents(
         product: ProductEntity,
         units: List<ProductUnitEntity>,
-        components: List<CompositeComponentEntity>
+        components: List<CompositeComponentEntity>,
+        insertOpeningStockMovement: Boolean = false
     ): Long {
         val productId = insertProduct(product)
         deleteUnitsForProduct(productId)
+
         if (units.isNotEmpty()) {
             insertProductUnits(units.map { it.copy(productId = productId) })
         }
+
         deleteCompositeComponentsForProduct(productId)
         if (components.isNotEmpty()) {
             insertCompositeComponents(components.map { it.copy(parentProductId = productId) })
         }
+
+        if (insertOpeningStockMovement && product.availableQuantity > 0.0) {
+            val rate = getCurrencyByCode(product.transactionCurrency)?.exchangeRateToBase ?: 1550.0
+            insertStockMovement(
+                StockMovementEntity(
+                    productId = productId,
+                    productName = product.name,
+                    movementType = StockMovementType.OPENING_STOCK,
+                    quantityDelta = product.availableQuantity,
+                    balanceAfter = product.availableQuantity,
+                    unitName = product.baseUnitName,
+                    unitCostAtMovement = product.costPrice,
+                    unitPriceAtMovement = product.retailPrice,
+                    currencyCode = product.transactionCurrency,
+                    exchangeRateLocked = rate,
+                    reasonOrNotes = "رصيد افتتاحي عند تعريف الصنف"
+                )
+            )
+        }
+
         return productId
     }
 
@@ -430,8 +457,9 @@ interface SanadDao {
             return invoiceId
         }
 
-        // Net invoice-level landed cost adjustments for Purchase WAC (Shipping + VAT - Supplier Discount)
-        val netPurchaseAdjustments = finalInvoice.additionAmount + finalInvoice.vatAmount - finalInvoice.discountAmount
+        // Net invoice-level landed cost adjustments for Purchase WAC (Shipping + VAT Landed Cost - Supplier Discount)
+        val effectiveVatLandedCost = if (finalInvoice.vatLandedCost != 0.0) finalInvoice.vatLandedCost else finalInvoice.vatAmount
+        val netPurchaseAdjustments = finalInvoice.additionAmount + effectiveVatLandedCost - finalInvoice.discountAmount
         val totalLinesSubtotal = boundLines.sumOf { it.lineTotal }.takeIf { it > 0.0 } ?: 1.0
 
         // 1. Update Inventory Stock & Weighted Average Cost + Deduct Composite Bundle Components + FEFO

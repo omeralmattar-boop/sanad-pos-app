@@ -4,9 +4,6 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.util.Base64
 import android.util.Log
-import com.google.firebase.Firebase
-import com.google.firebase.ai.ai
-import com.google.firebase.ai.type.content
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.TimeoutCancellationException
@@ -14,11 +11,20 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
+import okhttp3.Response
+import org.json.JSONArray
+import org.json.JSONObject
 import java.io.ByteArrayOutputStream
+import java.util.concurrent.TimeUnit
 import kotlin.math.max
 import kotlin.math.roundToInt
 
 private const val TAG = "GeminiAssistantService"
+private const val GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models"
 
 enum class VoiceCommandIntentType(val arabicLabel: String) {
     SALES_INVOICE("فاتورة مبيعات"),
@@ -42,29 +48,12 @@ data class ParsedVoiceCommandAction(
 
 object GeminiAssistantService {
 
-    // Lazy initialization of Firebase AI Logic generative models
-    private val flashModel by lazy {
-        Firebase.ai.generativeModel("gemini-3.8-flash")
-    }
-
-    private val flashLiteModel by lazy {
-        Firebase.ai.generativeModel("gemini-3.5-flash-lite")
-    }
-
-    private val argonModel by lazy {
-        Firebase.ai.generativeModel("gemini-4-argon")
-    }
-
-    private fun selectSupportedModel(requestedModelName: String) = when {
-        requestedModelName.contains("argon") -> argonModel
-        requestedModelName.contains("lite") -> flashLiteModel
-        else -> flashModel
-    }
-
-    fun normalizeSupportedModelName(requestedModelName: String): String = when {
-        requestedModelName.contains("argon") -> "gemini-4-argon"
-        requestedModelName.contains("lite") -> "gemini-3.5-flash-lite"
-        else -> "gemini-3.8-flash"
+    private val okHttpClient by lazy {
+        OkHttpClient.Builder()
+            .connectTimeout(30, TimeUnit.SECONDS)
+            .readTimeout(60, TimeUnit.SECONDS)
+            .writeTimeout(60, TimeUnit.SECONDS)
+            .build()
     }
 
     fun sanitizeApiKey(rawKey: String?): String {
@@ -76,15 +65,12 @@ object GeminiAssistantService {
             .orEmpty()
     }
 
-    /**
-     * Optimizes and downscales an invoice or receipt Bitmap (maxDimension = 1024px)
-     * and encodes it as Base64 JPEG for fast multimodal inference.
-     */
-    fun optimizeBitmapForAi(bitmap: Bitmap, maxDimension: Int = 1024, jpegQuality: Int = 82): String {
+    fun optimizeBitmapForAi(bitmap: Bitmap, maxDimension: Int = 1024, jpegQuality: Int = 82): Bitmap {
         val width = bitmap.width
         val height = bitmap.height
         val largestSide = max(width, height)
-        val resized = if (largestSide > maxDimension) {
+
+        return if (largestSide > maxDimension) {
             val ratio = maxDimension.toFloat() / largestSide.toFloat()
             val targetW = (width * ratio).roundToInt().coerceAtLeast(1)
             val targetH = (height * ratio).roundToInt().coerceAtLeast(1)
@@ -92,49 +78,115 @@ object GeminiAssistantService {
         } else {
             bitmap
         }
-        val bos = ByteArrayOutputStream()
-        resized.compress(Bitmap.CompressFormat.JPEG, jpegQuality, bos)
-        return Base64.encodeToString(bos.toByteArray(), Base64.NO_WRAP)
     }
 
-    /**
-     * Tests the Firebase AI Logic Gemini connection (`Firebase.ai`) with a 60s timeout.
-     */
-    suspend fun testConnection(rawApiKey: String = "", modelName: String = "gemini-3.8-flash"): Result<String> =
-        withContext(Dispatchers.IO) {
-            val validModelName = normalizeSupportedModelName(modelName)
-            val activeModel = selectSupportedModel(validModelName)
-            try {
-                val response = withTimeout(60_000L) {
-                    activeModel.generateContent("رد بكلمة واحدة فقط: متصل")
-                }
-                val text = response.text?.trim().orEmpty()
-                if (text.isNotEmpty()) {
-                    Result.success("اتصال ناجح ومستقر عبر Firebase AI Logic ($validModelName): $text")
-                } else {
-                    Result.failure(IllegalStateException("أعاد النموذج استجابة فارغة."))
-                }
-            } catch (e: TimeoutCancellationException) {
-                Log.e(TAG, "Firebase AI connection test timed out", e)
-                Result.failure(IllegalStateException("انتهت مهلة الاتصال بعد 60 ثانية. يرجى المحاولة مرة أخرى."))
-            } catch (e: CancellationException) {
-                throw e
-            } catch (e: Exception) {
-                Log.e(TAG, "Firebase AI connection test failed", e)
-                Result.failure(IllegalStateException(e.localizedMessage ?: "تعذر الاتصال بخدمة Firebase AI Logic"))
-            }
+    fun bitmapToBase64Jpeg(bitmap: Bitmap, jpegQuality: Int = 82): String {
+        val output = ByteArrayOutputStream()
+        bitmap.compress(Bitmap.CompressFormat.JPEG, jpegQuality, output)
+        return Base64.encodeToString(output.toByteArray(), Base64.NO_WRAP)
+    }
+
+    private fun buildGeminiUrl(modelName: String, apiKey: String): String {
+        val safeModel = modelName.ifBlank { "gemini-1.5-flash" }
+        return "$GEMINI_BASE_URL/$safeModel:generateContent?key=${apiKey.trim()}"
+    }
+
+    private fun generateDirectText(
+        prompt: String,
+        modelName: String = "gemini-1.5-flash",
+        apiKey: String = "",
+        imageBase64: String? = null
+    ): String {
+        val key = sanitizeApiKey(apiKey)
+        require(key.isNotBlank()) { "مفتاح Gemini API فارغ. أضف API key بشكل صحيح." }
+
+        val parts = JSONArray()
+        parts.put(JSONObject().put("text", prompt))
+
+        if (!imageBase64.isNullOrBlank()) {
+            val inlineData = JSONObject()
+                .put("mime_type", "image/jpeg")
+                .put("data", imageBase64)
+
+            val imagePart = JSONObject()
+                .put("inline_data", inlineData)
+
+            parts.put(imagePart)
         }
 
-    /**
-     * Streams a financial chat response from Firebase AI Logic (`generateContentStream`)
-     * to minimize Time-to-First-Token (TTFT).
-     */
+        val payload = JSONObject()
+            .put("contents", JSONArray().put(JSONObject().put("parts", parts)))
+            .toString()
+
+        val request = Request.Builder()
+            .url(buildGeminiUrl(modelName, key))
+            .post(payload.toRequestBody("application/json; charset=utf-8".toMediaType()))
+            .build()
+
+        return executeGeminiRequest(request)
+    }
+
+    private fun executeGeminiRequest(request: Request): String {
+        val response: Response = okHttpClient.newCall(request).execute()
+        if (!response.isSuccessful) {
+            val errorBody = response.body?.string().orEmpty()
+            response.close()
+            throw IllegalStateException("Gemini API failed: ${response.code} ${response.message}. Body: $errorBody")
+        }
+
+        val rawBody = response.body?.string().orEmpty()
+        response.close()
+
+        val root = JSONObject(rawBody)
+        val candidates = root.optJSONArray("candidates") ?: return ""
+        val firstCandidate = candidates.optJSONObject(0) ?: return ""
+        val content = firstCandidate.optJSONObject("content") ?: return ""
+        val resultParts = content.optJSONArray("parts") ?: return ""
+
+        val builder = StringBuilder()
+        for (i in 0 until resultParts.length()) {
+            val part = resultParts.optJSONObject(i) ?: continue
+            val text = part.optString("text", "")
+            if (text.isNotEmpty()) builder.append(text)
+        }
+        return builder.toString().trim()
+    }
+
+    suspend fun testConnection(
+        rawApiKey: String = "",
+        modelName: String = "gemini-1.5-flash"
+    ): Result<String> = withContext(Dispatchers.IO) {
+        try {
+            val text = withTimeout(60_000L) {
+                generateDirectText(
+                    prompt = "رد بكلمة واحدة فقط: متصل",
+                    modelName = modelName,
+                    apiKey = rawApiKey
+                )
+            }
+
+            if (text.isNotEmpty()) {
+                Result.success("اتصال ناجح ومستقر عبر Gemini REST API ($modelName): $text")
+            } else {
+                Result.failure(IllegalStateException("أعاد النموذج استجابة فارغة."))
+            }
+        } catch (e: TimeoutCancellationException) {
+            Log.e(TAG, "Gemini connection timed out", e)
+            Result.failure(IllegalStateException("انتهت مهلة الاتصال بعد 60 ثانية. يرجى المحاولة مرة أخرى."))
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.e(TAG, "Gemini connection test failed", e)
+            Result.failure(IllegalStateException(e.localizedMessage ?: "تعذر الاتصال بخدمة Gemini REST API"))
+        }
+    }
+
     fun streamFinancialAssistant(
         userPrompt: String,
         liveDatabaseSummary: String,
-        modelName: String = "gemini-3.8-flash"
+        modelName: String = "gemini-1.5-flash",
+        rawApiKey: String = ""
     ): Flow<String> = flow {
-        val activeModel = selectSupportedModel(modelName)
         val fullPrompt = """
             أنت "المستشار المالي الذكي" داخل نظام سند المحاسبي المتكامل ونقاط البيع.
             لديك الملخص الحي التالي من قاعدة البيانات المحلية:
@@ -143,36 +195,31 @@ object GeminiAssistantService {
             سؤال المستخدم أو أمره: $userPrompt
         """.trimIndent()
 
-        val accumulated = StringBuilder()
-        withTimeout(60_000L) {
-            activeModel.generateContentStream(fullPrompt).collect { chunk ->
-                val part = chunk.text.orEmpty()
-                if (part.isNotEmpty()) {
-                    accumulated.append(part)
-                    emit(accumulated.toString())
-                }
+        try {
+            val text = withTimeout(60_000L) {
+                generateDirectText(
+                    prompt = fullPrompt,
+                    modelName = modelName,
+                    apiKey = rawApiKey
+                )
             }
+            if (text.isNotEmpty()) emit(text)
+        } catch (e: Exception) {
+            Log.e(TAG, "streamFinancialAssistant failed", e)
+            emit(buildLocalAnalyticalResponse(userPrompt, liveDatabaseSummary))
         }
     }
 
-    /**
-     * Sends a financial chat prompt + live database context to Gemini via Firebase AI Logic (`Firebase.ai`)
-     * and returns the Arabic financial advisor response.
-     */
     suspend fun askFinancialAssistant(
         userPrompt: String,
         liveDatabaseSummary: String,
         rawApiKey: String = "",
-        modelName: String = "gemini-3.8-flash",
+        modelName: String = "gemini-1.5-flash",
         optionalBase64Image: String? = null
     ): String = withContext(Dispatchers.IO) {
-        // Check instant OCR/Guide specialized keywords first
-        val instantGuideReply = checkInstantOcrGuideQuery(userPrompt)
-        if (instantGuideReply != null) {
-            return@withContext instantGuideReply
-        }
+        val guideReply = checkInstantOcrGuideQuery(userPrompt)
+        if (guideReply != null) return@withContext guideReply
 
-        val activeModel = selectSupportedModel(modelName)
         val systemPrompt = """
             أنت "المستشار المالي الذكي" داخل نظام سند المحاسبي المتكامل ونقاط البيع.
             لديك الملخص الحي التالي من قاعدة البيانات المحلية:
@@ -182,47 +229,51 @@ object GeminiAssistantService {
         """.trimIndent()
 
         try {
-            val response = withTimeout(60_000L) {
+            val responseText = withTimeout(60_000L) {
                 if (!optionalBase64Image.isNullOrBlank()) {
                     val bytes = Base64.decode(optionalBase64Image, Base64.DEFAULT)
                     val bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
                     if (bitmap != null) {
-                        activeModel.generateContent(
-                            content {
-                                image(bitmap)
-                                text(systemPrompt)
-                            }
+                        val optimized = withContext(Dispatchers.Default) {
+                            optimizeBitmapForAi(bitmap, 1024)
+                        }
+                        val imageBase64 = withContext(Dispatchers.Default) {
+                            bitmapToBase64Jpeg(optimized)
+                        }
+                        generateDirectText(
+                            prompt = systemPrompt,
+                            modelName = modelName,
+                            apiKey = rawApiKey,
+                            imageBase64 = imageBase64
                         )
                     } else {
-                        activeModel.generateContent(systemPrompt)
+                        generateDirectText(
+                            prompt = systemPrompt,
+                            modelName = modelName,
+                            apiKey = rawApiKey
+                        )
                     }
                 } else {
-                    activeModel.generateContent(systemPrompt)
+                    generateDirectText(
+                        prompt = systemPrompt,
+                        modelName = modelName,
+                        apiKey = rawApiKey
+                    )
                 }
             }
-            val reply = response.text?.trim().orEmpty()
-            if (reply.isNotEmpty()) {
-                return@withContext reply
-            }
+
+            if (responseText.isNotEmpty()) return@withContext responseText
         } catch (e: TimeoutCancellationException) {
-            Log.e(TAG, "Firebase AI financial assistant timed out", e)
+            Log.e(TAG, "Gemini financial assistant timed out", e)
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
-            Log.e(TAG, "Firebase AI financial assistant call failed", e)
+            Log.e(TAG, "Gemini financial assistant call failed", e)
         }
 
         buildLocalAnalyticalResponse(userPrompt, liveDatabaseSummary)
     }
 
-    /**
-     * Unified Voice Command Router (موجه الأوامر الصوتية الشامل):
-     * Routes spoken Arabic text into one of the 4 core transactional workflows:
-     * 1. فاتورة مبيعات (Sales Invoice)
-     * 2. فاتورة مشتريات (Purchase Invoice)
-     * 3. قيد دين / واصل (Debt / Receipt Voucher)
-     * 4. مصروف يومي (Daily Expense)
-     */
     fun routeUnifiedArabicVoiceCommand(spokenText: String): ParsedVoiceCommandAction {
         val normalized = spokenText.trim()
         val extractedNumber = Regex("(\\d+(?:\\.\\d+)?)")
@@ -325,7 +376,7 @@ object GeminiAssistantService {
         }
     }
 
-    private fun checkInstantOcrGuideQuery(prompt: String): String? {
+    fun checkInstantOcrGuideQuery(prompt: String): String? {
         val lower = prompt.lowercase()
         if (lower.contains("ocrpurchasepaths") || prompt.contains("مسارات تصوير")) {
             return """
@@ -337,17 +388,19 @@ object GeminiAssistantService {
                 • ملاحظة: لا يوجد زر OCR داخل تبويب الفواتير أو نموذج الشراء اليدوي.
             """.trimIndent()
         }
+
         if (lower.contains("ocrpurchasebuttons") || prompt.contains("أزرار تصوير")) {
             return """
                 أزرار معالج تصوير فاتورة المورد (ocrPurchaseButtons):
                 • المرحلة 1 (الالتقاط): [التقاط صورة]، [اختيار من المعرض]، [اختيار ملف PDF <= 8MB]، مؤشر القراءة، وتلميح المدة/الخصوصية.
                 • نافذة المسودة (24 ساعة): [استئناف | بدء من جديد | إلغاء].
-                • المرحلة 2 (المراجعة وكل سطر): [رجوع]، [مساعدة (?)]، اختيار/إضافة مورد، رقم ضريبي، رقم فاتورة (OCR-*)، عملة الورقة، ولكل سطر: [مطابقة / إعادة مطابقة]، [إنشاء جديد]، [تجاهل / إلغاء التجاهل]، [تأكيد مجاني / تكلفة صفر]، [تفعيل تتبع الدفعات FEFO]، وزرّا [تصحيح من الوحدة] و[تصحيح من المجموع].
+                • المرحلة 2 (المراجعة وكل سطر): [رجوع]، [مساعدة (?)]، اختيار/إضافة مورد، رقم ضريبي، رقم فاتورة (OCR-*), عملة الورقة، ولكل سطر: [مطابقة / إعادة مطابقة]، [إنشاء جديد]، [تجاهل / إلغاء التجاهل]، [تأكيد مجاني / تكلفة صفر]، [تفعيل تتبع الدفعات FEFO]، وزرّا [تصحيح من الوحدة] و[تصحيح من المجموع].
                 • المرحلة 3 و 4: [متابعة] في الأسعار الجديدة ورادار الأسعار.
                 • المرحلة 5 (الدفع والمنصة): اختيار مصدر دفع واحد فقط [نقد | حساب بنكي | آجل]، تفعيل الضريبة، [تضمين الضريبة في التكلفة]، التعديلات المالية، [الإبقاء على عملة الورقة]، الملاحظات، ملخص الأسطر المرفوضة، و[تأكيد وحفظ].
                 • المرحلة 6: رقم الفاتورة النهائي (PUR-...) وزر [تم].
             """.trimIndent()
         }
+
         if (lower.contains("ocr") || prompt.contains("تصوير فاتورة") || prompt.contains("فاتورة مورد")) {
             return """
                 دليل معالج تصوير فاتورة المورد بالذكاء الاصطناعي (ocrPurchaseFlow - 6 مراحل):
@@ -359,13 +412,14 @@ object GeminiAssistantService {
                 6. الحفظ النهائي ووسم الفاتورة بالوردية المفتوحة.
             """.trimIndent()
         }
+
         return null
     }
 
     private fun buildLocalAnalyticalResponse(prompt: String, liveSummary: String): String {
         checkInstantOcrGuideQuery(prompt)?.let { return it }
         return """
-            تحليل المحاسب الذكي (سند AI - Firebase AI Logic):
+            تحليل المحاسب الذكي (سند AI - Gemini REST API):
             بناءً على بياناتك الحية في قاعدة البيانات:
             $liveSummary
             
